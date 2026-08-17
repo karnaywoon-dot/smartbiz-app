@@ -1,80 +1,146 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { GoogleGenerativeAI } from '@google/generative-ai';
+import { createClient } from '@supabase/supabase-js';
+
+// Supabase Client Initializer (သင်၏ VITE_SUPABASE_URL နှင့် VITE_SUPABASE_ANON_KEY ကို .env တွင် စစ်ပါ)
+const supabaseUrl = import.meta.env.VITE_SUPABASE_URL || '';
+const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY || '';
+const supabase = createClient(supabaseUrl, supabaseAnonKey);
 
 export default function App() {
   const [input, setInput] = useState('');
   const [reply, setReply] = useState('');
-  const [loading, setLoading] = useState(false);
-  
+  const [chatLoading, setChatLoading] = useState(false);
+
   // Slip State
+  const [customerName, setCustomerName] = useState('');
   const [image, setImage] = useState<File | null>(null);
   const [expectedAmount, setExpectedAmount] = useState('');
   const [slipResult, setSlipResult] = useState<string>('');
+  const [slipLoading, setSlipLoading] = useState(false);
+
+  // Database Orders State
+  const [orders, setOrders] = useState<any[]>([]);
+
+  // Supabase မှ Order များ ဆွဲထုတ်သည့် Function
+  const fetchOrders = async () => {
+    const { data, error } = await supabase
+      .from('cod_orders')
+      .select('*')
+      .order('created_at', { ascending: false });
+
+    if (!error && data) {
+      setOrders(data);
+    }
+  };
+
+  useEffect(() => {
+    fetchOrders();
+  }, []);
 
   // 1. Text AI Chat
   const handleSend = async () => {
     if (!input) return;
-    setLoading(true);
+    setChatLoading(true);
+    setReply('');
     try {
       const apiKey = import.meta.env.VITE_GEMINI_API_KEY;
       const genAI = new GoogleGenerativeAI(apiKey);
-      const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+      const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
 
       const prompt = `You are a helpful B2B AI Sales Assistant in Myanmar. Answer concisely in Myanmar language: ${input}`;
       const result = await model.generateContent(prompt);
       setReply(result.response.text());
     } catch (error) {
+      console.error("Chat Error:", error);
       setReply('API Key သို့မဟုတ် ချိတ်ဆက်မှု စစ်ဆေးပါ။');
     } finally {
-      setLoading(false);
+      setChatLoading(false);
     }
   };
 
-  // 2. Vision AI - Slip Check
+  // Helper Function: Convert File to Base64
+  const fileToGenerativePart = async (file: File) => {
+    return new Promise<{ inlineData: { data: string; mimeType: string } }>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        const base64Data = (reader.result as string).split(',')[1];
+        resolve({
+          inlineData: {
+            data: base64Data,
+            mimeType: file.type,
+          },
+        });
+      };
+      reader.onerror = reject;
+      reader.readAsDataURL(file);
+    });
+  };
+
+  // 2. Vision AI & Supabase Database Insertion
   const handleSlipVerify = async () => {
     if (!image || !expectedAmount) {
       alert('စလစ်ပုံနှင့် စစ်ဆေးလိုသော ငွေပမာဏကို ထည့်ပေးပါ။');
       return;
     }
-    setLoading(true);
+    setSlipLoading(true);
     setSlipResult('');
 
     try {
       const apiKey = import.meta.env.VITE_GEMINI_API_KEY;
       const genAI = new GoogleGenerativeAI(apiKey);
-      const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+      const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
 
-      // Convert File to Base64
-      const reader = new FileReader();
-      reader.readAsDataURL(image);
-      reader.onloadend = async () => {
-        const base64Data = (reader.result as string).split(',')[1];
-        
-        const prompt = `
-        Analyze this Myanmar payment slip image (KPay, WavePay, CBPay, AYA, KBZ etc.).
-        Extract the total transferred amount and the transaction ID.
-        Return strictly in this format:
-        Amount: [extracted number]
-        TxnID: [extracted string]
-        `;
+      const imagePart = await fileToGenerativePart(image);
 
-        const result = await model.generateContent([
-          prompt,
-          { inlineData: { data: base64Data, mimeType: image.type } }
-        ]);
+      // JSON သီးသန့် ပြန်ထုတ်ခိုင်းသော Prompt
+      const prompt = `
+      Analyze this Myanmar payment slip image (KPay, WavePay, CBPay, AYA, KBZ etc.).
+      Extract the total transferred amount and transaction ID.
+      The expected amount to verify is: ${expectedAmount} MMK.
 
-        const text = result.response.text();
-        setSlipResult(text);
-      };
-    } catch (error) {
-      setSlipResult('စလစ်အား စစ်ဆေး၍ မရပါ၊ ပုံစံ မှန်မမှန် ပြန်စစ်ပါ။');
+      Respond ONLY in raw valid JSON format without markdown code blocks.
+      Format:
+      {
+        "amount": number_extracted,
+        "transaction_id": "extracted_id_or_unknown",
+        "status": "MATCHED_or_MISMATCHED"
+      }
+      `;
+
+      const result = await model.generateContent([prompt, imagePart]);
+      const rawText = result.response.text().replace(/```json|```/g, '').trim();
+      const parsedData = JSON.parse(rawText);
+
+      setSlipResult(
+        `ကျသင့်ငွေ: ${expectedAmount} MMK\nစလစ်ပါငွေ: ${parsedData.amount} MMK\nအခြေအနေ: ${parsedData.status}\nTransaction ID: ${parsedData.transaction_id}`
+      );
+
+      // Supabase cod_orders Table ထဲသို့ Data ထည့်သွင်းခြင်း
+      const { error: dbError } = await supabase.from('cod_orders').insert([
+        {
+          customer_name: customerName || 'General Customer',
+          amount: parsedData.amount || Number(expectedAmount),
+          transaction_id: parsedData.transaction_id,
+          status: parsedData.status,
+        },
+      ]);
+
+      if (dbError) {
+        console.error('Supabase Save Error:', dbError);
+      } else {
+        fetchOrders(); // UI ရဲ့ Table ကို အလိုအလျောက် Update လုပ်မည်
+      }
+    } catch (error: any) {
+      console.error("OCR Error Detail:", error);
+      setSlipResult(`စလစ်အား စစ်ဆေး၍ မရပါ (${error?.message || 'Error occurred'})`);
     } finally {
-      setLoading(false);
+      setSlipLoading(false);
     }
   };
 
   return (
-    <div style={{ padding: '30px', maxWidth: '550px', margin: '0 auto', fontFamily: 'sans-serif' }}>
+    <div style={{ padding: '30px', maxWidth: '650px', margin: '0 auto', fontFamily: 'sans-serif' }}>
       <h2 style={{ textAlign: 'center' }}>SmartBiz AI B2B Suite</h2>
 
       {/* Feature 1: AI Chat */}
@@ -89,9 +155,10 @@ export default function App() {
         />
         <button
           onClick={handleSend}
+          disabled={chatLoading}
           style={{ width: '100%', padding: '10px', backgroundColor: '#0070f3', color: 'white', border: 'none', borderRadius: '4px', cursor: 'pointer' }}
         >
-          {loading ? 'မေးမြန်းနေသည်...' : 'မေးမည်'}
+          {chatLoading ? 'မေးမြန်းနေသည်...' : 'မေးမည်'}
         </button>
         {reply && (
           <div style={{ marginTop: '10px', padding: '10px', backgroundColor: '#f0f4f8', borderRadius: '4px' }}>
@@ -102,8 +169,15 @@ export default function App() {
       </div>
 
       {/* Feature 2: Slip OCR Verification */}
-      <div style={{ border: '1px solid #ddd', padding: '15px', borderRadius: '8px' }}>
+      <div style={{ border: '1px solid #ddd', padding: '15px', borderRadius: '8px', marginBottom: '20px' }}>
         <h3>၂။ KPay / Bank Slip OCR Checker</h3>
+        <input
+          type="text"
+          value={customerName}
+          onChange={(e) => setCustomerName(e.target.value)}
+          placeholder="ဝယ်ယူသူအမည် (Customer Name)"
+          style={{ width: '95%', padding: '10px', marginBottom: '10px' }}
+        />
         <input
           type="file"
           accept="image/*"
@@ -119,15 +193,47 @@ export default function App() {
         />
         <button
           onClick={handleSlipVerify}
+          disabled={slipLoading}
           style={{ width: '100%', padding: '10px', backgroundColor: '#28a745', color: 'white', border: 'none', borderRadius: '4px', cursor: 'pointer' }}
         >
-          {loading ? 'စလစ်အား စစ်ဆေးနေသည်...' : 'စလစ်စစ်မည်'}
+          {slipLoading ? 'စလစ်အား စစ်ဆေးနေသည်...' : 'စလစ်စစ်မည်'}
         </button>
         {slipResult && (
           <div style={{ marginTop: '10px', padding: '10px', backgroundColor: '#eef9f1', borderRadius: '4px' }}>
             <strong>စလစ် စစ်ဆေးချက် ရလဒ်:</strong>
             <pre style={{ whiteSpace: 'pre-wrap' }}>{slipResult}</pre>
           </div>
+        )}
+      </div>
+
+      {/* Feature 3: Order History Dashboard */}
+      <div style={{ border: '1px solid #ddd', padding: '15px', borderRadius: '8px' }}>
+        <h3>၃။ စလစ်စစ်ဆေးပြီး နောက်ဆုံး အမှာစာများ (Supabase DB)</h3>
+        {orders.length === 0 ? (
+          <p style={{ color: '#888' }}>မှတ်တမ်း မရှိသေးပါ။</p>
+        ) : (
+          <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left' }}>
+            <thead>
+              <tr style={{ borderBottom: '2px solid #ddd' }}>
+                <th style={{ padding: '8px' }}>အမည်</th>
+                <th style={{ padding: '8px' }}>ငွေပမာဏ</th>
+                <th style={{ padding: '8px' }}>Txn ID</th>
+                <th style={{ padding: '8px' }}>အခြေအနေ</th>
+              </tr>
+            </thead>
+            <tbody>
+              {orders.map((o) => (
+                <tr key={o.id} style={{ borderBottom: '1px solid #eee' }}>
+                  <td style={{ padding: '8px' }}>{o.customer_name}</td>
+                  <td style={{ padding: '8px' }}>{o.amount?.toLocaleString()} MMK</td>
+                  <td style={{ padding: '8px' }}>{o.transaction_id}</td>
+                  <td style={{ padding: '8px', color: o.status === 'MATCHED' ? 'green' : 'red' }}>
+                    {o.status}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         )}
       </div>
     </div>
